@@ -1,0 +1,6 @@
+{
+  "name": "NutriVision AI",
+  "description": "Professional-grade AI nutrition analysis from photos of meals, drinks, and labels, featuring history tracking and professional dietary insights.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
