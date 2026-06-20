@@ -9,6 +9,7 @@ import com.example.data.api.RetrofitClient
 import com.example.data.local.MealDatabase
 import com.example.data.local.MealRecord
 import com.example.data.model.AdvancedNutritionAnalysis
+import com.example.data.repository.FirebaseAuthRepository
 import com.example.data.repository.NutritionRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -28,6 +29,7 @@ class NutritionViewModel(application: Application) : AndroidViewModel(applicatio
 
     private val database = MealDatabase.getDatabase(application)
     private val repository = NutritionRepository(database.mealRecordDao, RetrofitClient.moshiInstance)
+    val authRepository = FirebaseAuthRepository(application, database.mealRecordDao)
 
     // Observed list of saved meals
     val savedMeals: StateFlow<List<MealRecord>> = repository.allMeals
@@ -98,6 +100,9 @@ class NutritionViewModel(application: Application) : AndroidViewModel(applicatio
                 rawJson = jsonString
             )
             repository.insertMeal(record)
+
+            // Auto-upload to cloud Firestore if user is authenticated
+            authRepository.uploadMealToCloudSync(record)
             
             // Go back to idle to let user view database / history
             _analysisState.value = AnalysisState.Idle
@@ -116,4 +121,87 @@ class NutritionViewModel(application: Application) : AndroidViewModel(applicatio
             repository.clearHistory()
         }
     }
+
+    fun performRealtimeSync() {
+        viewModelScope.launch {
+            authRepository.performLocalCloudSync()
+        }
+    }
+
+    // Export local SQLite / Room data table to external standard JSON backup
+    fun exportDataToJson(outputStream: java.io.OutputStream): Boolean {
+        return try {
+            val meals = savedMeals.value
+            val recordsMap = meals.map {
+                mapOf(
+                    "itemName" to it.itemName,
+                    "timestamp" to it.timestamp,
+                    "estimatedMassG" to it.estimatedMassG,
+                    "energyKcal" to it.energyKcal,
+                    "proteinG" to it.proteinG,
+                    "carbsG" to it.carbsG,
+                    "fatG" to it.fatG,
+                    "rawJson" to it.rawJson,
+                    "imagePath" to it.imagePath
+                )
+            }
+            val adapter = RetrofitClient.moshiInstance.adapter(Any::class.java)
+            val jsonString = adapter.toJson(recordsMap)
+            outputStream.write(jsonString.toByteArray(Charsets.UTF_8))
+            outputStream.flush()
+            outputStream.close()
+            true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
+        }
+    }
+
+    // Import and append backups back into local database
+    fun importFromBackupJson(inputStream: java.io.InputStream): String? {
+        return try {
+            val rawStr = inputStream.bufferedReader().use { it.readText() }
+            val adapter = RetrofitClient.moshiInstance.adapter(List::class.java)
+            val parsedList = adapter.fromJson(rawStr) as? List<Map<String, Any?>> ?: return "Invalid backup file format."
+            
+            viewModelScope.launch {
+                for (item in parsedList) {
+                    try {
+                        val itemName = item["itemName"] as? String ?: "Meal"
+                        val timestamp = (item["timestamp"] as? Double)?.toLong() ?: System.currentTimeMillis()
+                        val estimatedMassG = (item["estimatedMassG"] as? Double)?.toInt() ?: 100
+                        val energyKcal = (item["energyKcal"] as? Double) ?: 0.0
+                        val proteinG = (item["proteinG"] as? Double) ?: 0.0
+                        val carbsG = (item["carbsG"] as? Double) ?: 0.0
+                        val fatG = (item["fatG"] as? Double) ?: 0.0
+                        val rawJson = item["rawJson"] as? String ?: "{}"
+                        val imagePath = item["imagePath"] as? String
+
+                        val record = MealRecord(
+                            itemName = itemName,
+                            timestamp = timestamp,
+                            estimatedMassG = estimatedMassG,
+                            energyKcal = energyKcal,
+                            proteinG = proteinG,
+                            carbsG = carbsG,
+                            fatG = fatG,
+                            rawJson = rawJson,
+                            imagePath = imagePath
+                        )
+                        repository.insertMeal(record)
+                        
+                        // Async upload to Firestore too if logged in
+                        authRepository.uploadMealToCloudSync(record)
+                    } catch (innerEx: Exception) {
+                        innerEx.printStackTrace()
+                    }
+                }
+            }
+            null // Success
+        } catch (e: Exception) {
+            e.printStackTrace()
+            e.localizedMessage ?: "Failed during backup restoration parser."
+        }
+    }
 }
+
